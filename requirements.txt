@@ -1,0 +1,7 @@
+groq
+python-dotenv
+sounddevice
+numpy
+flask
+flask-cors
+soundfile

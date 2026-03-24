@@ -1,0 +1,468 @@
+<!DOCTYPE html>
+<html lang="nl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Admin Dashboard — NVL Compliance</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@300;400;500&display=swap');
+  *{margin:0;padding:0;box-sizing:border-box}
+  :root{
+    --bg:#0D0D0D;--surface:#161616;--surface2:#1E1E1E;--border:#2A2A2A;
+    --text:#E8E8E8;--text-muted:#666;--text-dim:#444;
+    --green:#00C853;--yellow:#FFD600;--red:#FF1744;--blue:#2979FF;
+    --green-bg:rgba(0,200,83,.08);--yellow-bg:rgba(255,214,0,.08);--red-bg:rgba(255,23,68,.08);
+    --blue-bg:rgba(41,121,255,.08);
+  }
+  body{font-family:'IBM Plex Sans',sans-serif;background:var(--bg);color:var(--text);min-height:100vh;display:flex;flex-direction:column}
+  @keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
+  @keyframes fadeUp{from{opacity:0;transform:translateY(4px)}to{opacity:1;transform:translateY(0)}}
+  @keyframes flashIn{from{background:rgba(255,214,0,.15)}to{background:transparent}}
+
+  /* ── LOGIN ─────────────────────────────────────────────────────────── */
+  #login-screen{flex:1;display:flex;align-items:center;justify-content:center;padding:40px 20px}
+  .login-box{width:100%;max-width:400px}
+  .brand{display:flex;align-items:center;gap:12px;margin-bottom:48px}
+  .brand-dot{width:10px;height:10px;border-radius:50%;background:var(--red);box-shadow:0 0 12px var(--red);animation:pulse 2s infinite}
+  .brand-name{font-family:'IBM Plex Mono',monospace;font-size:13px;letter-spacing:.15em;color:var(--text-muted);text-transform:uppercase}
+  .login-title{font-size:28px;font-weight:300;line-height:1.3;margin-bottom:8px;letter-spacing:-.02em}
+  .login-sub{font-size:14px;color:var(--text-muted);margin-bottom:40px;line-height:1.6}
+  .field-label{font-family:'IBM Plex Mono',monospace;font-size:11px;letter-spacing:.12em;color:var(--text-dim);text-transform:uppercase;display:block;margin-bottom:8px}
+  .field-wrap{margin-bottom:20px}
+  .field-wrap input{width:100%;background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:12px 14px;font-family:'IBM Plex Sans',sans-serif;font-size:14px;color:var(--text);outline:none;transition:border-color .15s}
+  .field-wrap input:focus{border-color:var(--red)}
+  .login-btn{width:100%;padding:14px;background:var(--red);border:none;border-radius:6px;font-family:'IBM Plex Sans',sans-serif;font-size:14px;font-weight:500;color:white;cursor:pointer;transition:opacity .15s;letter-spacing:.02em;margin-bottom:12px}
+  .login-btn:hover{opacity:.88}
+  .login-error{display:none;font-family:'IBM Plex Mono',monospace;font-size:12px;color:var(--red);padding:8px 12px;background:var(--red-bg);border:1px solid rgba(255,23,68,.2);border-radius:4px;text-align:center}
+  .login-error.show{display:block}
+
+  /* ── TOPBAR ────────────────────────────────────────────────────────── */
+  #main-screen{display:none;flex-direction:column;min-height:100vh}
+  .topbar{display:flex;align-items:center;justify-content:space-between;padding:0 24px;height:52px;border-bottom:1px solid var(--border);background:var(--surface);flex-shrink:0}
+  .topbar-brand{font-family:'IBM Plex Mono',monospace;font-size:12px;letter-spacing:.1em;color:var(--text-muted)}
+  .topbar-right{display:flex;align-items:center;gap:16px}
+  .online-badge{display:flex;align-items:center;gap:6px;font-family:'IBM Plex Mono',monospace;font-size:12px;color:var(--green)}
+  .online-dot{width:7px;height:7px;border-radius:50%;background:var(--green);animation:pulse 1.5s infinite}
+  .logout-btn{font-family:'IBM Plex Mono',monospace;font-size:11px;letter-spacing:.08em;color:var(--text-dim);background:none;border:1px solid var(--border);border-radius:4px;padding:5px 10px;cursor:pointer;transition:all .15s}
+  .logout-btn:hover{color:var(--text-muted);border-color:#3A3A3A}
+
+  /* ── LAYOUT ────────────────────────────────────────────────────────── */
+  .main-content{display:grid;grid-template-columns:380px 1fr;flex:1;min-height:0;height:calc(100vh - 52px)}
+
+  /* ── LEFT PANEL ────────────────────────────────────────────────────── */
+  .agents-panel{border-right:1px solid var(--border);display:flex;flex-direction:column;overflow:hidden}
+  .panel-hdr{padding:14px 20px;border-bottom:1px solid var(--border);flex-shrink:0;display:flex;align-items:center;justify-content:space-between}
+  .panel-hdr-title{font-family:'IBM Plex Mono',monospace;font-size:11px;letter-spacing:.12em;color:var(--text-dim);text-transform:uppercase}
+  .panel-hdr-count{font-family:'IBM Plex Mono',monospace;font-size:11px;color:var(--text-dim)}
+  .agents-scroll{flex:1;overflow-y:auto;padding:12px}
+  .agents-scroll::-webkit-scrollbar{width:3px}
+  .agents-scroll::-webkit-scrollbar-thumb{background:var(--border)}
+  .agents-empty{font-family:'IBM Plex Mono',monospace;font-size:12px;color:var(--text-dim);padding:40px 20px;text-align:center}
+
+  /* Agent card */
+  .agent-card{border:1px solid var(--border);border-radius:8px;padding:16px;margin-bottom:10px;cursor:pointer;transition:all .15s;background:var(--surface);position:relative}
+  .agent-card:hover{border-color:#3A3A3A;background:var(--surface2)}
+  .agent-card.selected{border-color:var(--blue);background:var(--blue-bg)}
+  .agent-card.offline{opacity:.55}
+  .agent-card-top{display:flex;align-items:center;justify-content:space-between;margin-bottom:10px}
+  .agent-card-left{display:flex;align-items:center;gap:10px}
+  .status-dot{width:8px;height:8px;border-radius:50%;flex-shrink:0}
+  .status-dot.online{background:var(--green);box-shadow:0 0 6px var(--green);animation:pulse 2s infinite}
+  .status-dot.offline{background:var(--text-dim)}
+  .agent-name{font-size:14px;font-weight:500}
+  .role-badge{font-family:'IBM Plex Mono',monospace;font-size:10px;letter-spacing:.08em;text-transform:uppercase;padding:2px 7px;border-radius:3px;font-weight:500}
+  .role-badge.nvl{background:rgba(41,121,255,.12);color:#5B9EFF}
+  .role-badge.voltera{background:rgba(0,200,83,.1);color:#4ADE80}
+  .agent-counters{display:flex;gap:16px}
+  .counter{display:flex;align-items:baseline;gap:5px}
+  .counter-num{font-family:'IBM Plex Mono',monospace;font-size:22px;font-weight:500;line-height:1}
+  .counter-lbl{font-family:'IBM Plex Mono',monospace;font-size:10px;letter-spacing:.08em;color:var(--text-dim);text-transform:uppercase}
+  .counter.warn .counter-num{color:var(--yellow)}
+  .counter.crit .counter-num{color:var(--red)}
+  .agent-meta{font-family:'IBM Plex Mono',monospace;font-size:10px;color:var(--text-dim);margin-top:8px}
+
+  /* ── RIGHT PANEL ───────────────────────────────────────────────────── */
+  .detail-panel{display:flex;flex-direction:column;overflow:hidden}
+  .detail-empty{flex:1;display:flex;align-items:center;justify-content:center;flex-direction:column;gap:12px}
+  .detail-empty-icon{font-size:32px;opacity:.3}
+  .detail-empty-text{font-family:'IBM Plex Mono',monospace;font-size:12px;color:var(--text-dim);letter-spacing:.1em;text-transform:uppercase}
+  .detail-content{display:none;flex-direction:column;height:100%;overflow:hidden}
+
+  .detail-hdr{padding:20px 24px;border-bottom:1px solid var(--border);flex-shrink:0}
+  .detail-hdr-top{display:flex;align-items:center;justify-content:space-between;margin-bottom:12px}
+  .detail-agent-name{font-size:20px;font-weight:500}
+  .detail-status{display:flex;align-items:center;gap:6px;font-family:'IBM Plex Mono',monospace;font-size:11px}
+  .detail-status .status-dot{width:7px;height:7px}
+  .detail-meta{font-family:'IBM Plex Mono',monospace;font-size:11px;color:var(--text-dim);display:flex;gap:24px}
+
+  .detail-scores{display:grid;grid-template-columns:repeat(4,1fr);gap:1px;background:var(--border);flex-shrink:0}
+  .detail-score-cell{background:var(--surface);padding:14px 12px;text-align:center}
+  .detail-score-num{font-family:'IBM Plex Mono',monospace;font-size:28px;font-weight:500;line-height:1;margin-bottom:3px}
+  .detail-score-cell:nth-child(1) .detail-score-num{color:var(--text-muted)}
+  .detail-score-cell:nth-child(2) .detail-score-num{color:var(--green)}
+  .detail-score-cell:nth-child(3) .detail-score-num{color:var(--yellow)}
+  .detail-score-cell:nth-child(4) .detail-score-num{color:var(--red)}
+  .detail-score-lbl{font-family:'IBM Plex Mono',monospace;font-size:10px;letter-spacing:.1em;color:var(--text-dim);text-transform:uppercase}
+
+  .violations-hdr{padding:12px 24px;border-bottom:1px solid var(--border);flex-shrink:0}
+  .violations-hdr-title{font-family:'IBM Plex Mono',monospace;font-size:11px;letter-spacing:.12em;color:var(--text-dim);text-transform:uppercase}
+  .violations-scroll{flex:1;overflow-y:auto;padding:16px 24px}
+  .violations-scroll::-webkit-scrollbar{width:3px}
+  .violations-scroll::-webkit-scrollbar-thumb{background:var(--border)}
+  .violations-empty{font-family:'IBM Plex Mono',monospace;font-size:12px;color:var(--text-dim);padding:40px 0;text-align:center}
+
+  .v-item{border-radius:8px;padding:14px 16px;margin-bottom:10px;border:1px solid transparent;animation:fadeUp .2s ease}
+  .v-item.critical{background:rgba(255,23,68,.06);border-color:rgba(255,23,68,.15)}
+  .v-item.warning{background:rgba(255,214,0,.06);border-color:rgba(255,214,0,.15)}
+  .v-item.flash{animation:flashIn .6s ease}
+  .v-item-top{display:flex;align-items:center;justify-content:space-between;margin-bottom:8px}
+  .v-sev{font-family:'IBM Plex Mono',monospace;font-size:10px;letter-spacing:.08em;text-transform:uppercase;font-weight:500;padding:2px 8px;border-radius:3px}
+  .v-item.critical .v-sev{background:rgba(255,23,68,.15);color:var(--red)}
+  .v-item.warning .v-sev{background:rgba(255,214,0,.15);color:var(--yellow)}
+  .v-time{font-family:'IBM Plex Mono',monospace;font-size:11px;color:var(--text-dim)}
+  .v-rule{font-size:13px;font-weight:500;margin-bottom:5px}
+  .v-quote{font-size:12px;color:var(--text-muted);font-style:italic;line-height:1.5;margin-bottom:5px;padding:6px 10px;background:rgba(255,255,255,.03);border-radius:4px;border-left:2px solid var(--border)}
+  .v-expl{font-size:11px;color:var(--text-dim);line-height:1.5}
+</style>
+</head>
+<body>
+
+<!-- ════════════════════════════ LOGIN ════════════════════════════ -->
+<div id="login-screen">
+  <div class="login-box">
+    <div class="brand">
+      <div class="brand-dot"></div>
+      <span class="brand-name">NVL · Compliance System</span>
+    </div>
+    <h1 class="login-title">Admin Dashboard</h1>
+    <p class="login-sub">NVL Compliance Monitor — beperkte toegang</p>
+    <div class="field-wrap">
+      <label class="field-label">Wachtwoord</label>
+      <input type="password" id="pw-input" placeholder="Voer wachtwoord in"
+             onkeydown="if(event.key==='Enter')doLogin()" />
+    </div>
+    <button class="login-btn" onclick="doLogin()">Inloggen</button>
+    <div class="login-error" id="login-error">Ongeldig wachtwoord</div>
+  </div>
+</div>
+
+<!-- ════════════════════════════ MAIN ════════════════════════════ -->
+<div id="main-screen">
+  <div class="topbar">
+    <span class="topbar-brand">NVL COMPLIANCE — ADMIN</span>
+    <div class="topbar-right">
+      <div class="online-badge">
+        <div class="online-dot"></div>
+        <span id="online-count">0 online</span>
+      </div>
+      <button class="logout-btn" onclick="doLogout()">Uitloggen</button>
+    </div>
+  </div>
+
+  <div class="main-content">
+
+    <!-- LEFT: agents list -->
+    <div class="agents-panel">
+      <div class="panel-hdr">
+        <span class="panel-hdr-title">Agents</span>
+        <span class="panel-hdr-count" id="agents-count">0 totaal</span>
+      </div>
+      <div class="agents-scroll" id="agents-scroll">
+        <div class="agents-empty" id="agents-empty">Geen agents actief</div>
+      </div>
+    </div>
+
+    <!-- RIGHT: detail -->
+    <div class="detail-panel" id="detail-panel">
+      <div class="detail-empty" id="detail-empty">
+        <div class="detail-empty-icon">⟵</div>
+        <div class="detail-empty-text">Selecteer een agent</div>
+      </div>
+      <div class="detail-content" id="detail-content">
+        <div class="detail-hdr">
+          <div class="detail-hdr-top">
+            <span class="detail-agent-name" id="d-name"></span>
+            <div class="detail-status" id="d-status">
+              <div class="status-dot offline" id="d-dot"></div>
+              <span id="d-status-text">Offline</span>
+            </div>
+          </div>
+          <div class="detail-meta">
+            <span id="d-connected">Online sinds: —</span>
+            <span id="d-lastactive">Laatste activiteit: —</span>
+          </div>
+        </div>
+        <div class="detail-scores">
+          <div class="detail-score-cell"><div class="detail-score-num" id="d-total">0</div><div class="detail-score-lbl">Checks</div></div>
+          <div class="detail-score-cell"><div class="detail-score-num" id="d-clean">0</div><div class="detail-score-lbl">Schoon</div></div>
+          <div class="detail-score-cell"><div class="detail-score-num" id="d-warning">0</div><div class="detail-score-lbl">Warning</div></div>
+          <div class="detail-score-cell"><div class="detail-score-num" id="d-critical">0</div><div class="detail-score-lbl">Critical</div></div>
+        </div>
+        <div class="violations-hdr">
+          <span class="violations-hdr-title">Overtredingen</span>
+        </div>
+        <div class="violations-scroll" id="d-violations">
+          <div class="violations-empty">Geen overtredingen deze sessie</div>
+        </div>
+      </div>
+    </div>
+
+  </div>
+</div>
+
+<script>
+const API_BASE = 'http://localhost:5000';
+const ADMIN_KEY = 'Voltera';
+const ADMIN_PASS = 'Voltera';
+
+let adminKey = null;
+let agentsData = {};
+let selectedAgent = null;
+let evtSource = null;
+let pollInterval = null;
+
+// ── Login ──────────────────────────────────────────────────────────────────
+function doLogin() {
+  const pw = document.getElementById('pw-input').value;
+  if (pw === ADMIN_PASS) {
+    adminKey = ADMIN_KEY;
+    document.getElementById('login-screen').style.display = 'none';
+    document.getElementById('main-screen').style.display = 'flex';
+    initDashboard();
+  } else {
+    document.getElementById('login-error').classList.add('show');
+    document.getElementById('pw-input').value = '';
+    document.getElementById('pw-input').focus();
+  }
+}
+
+function doLogout() {
+  adminKey = null;
+  selectedAgent = null;
+  agentsData = {};
+  if (evtSource) { evtSource.close(); evtSource = null; }
+  if (pollInterval) { clearInterval(pollInterval); pollInterval = null; }
+  document.getElementById('main-screen').style.display = 'none';
+  document.getElementById('login-screen').style.display = 'flex';
+  document.getElementById('pw-input').value = '';
+  document.getElementById('login-error').classList.remove('show');
+}
+
+// ── Init ───────────────────────────────────────────────────────────────────
+function initDashboard() {
+  fetchAgents();
+  connectSSE();
+  pollInterval = setInterval(fetchAgents, 5000); // fallback polling
+}
+
+// ── Fetch all agents ───────────────────────────────────────────────────────
+function fetchAgents() {
+  fetch(`${API_BASE}/admin/agents`, {
+    headers: { 'X-Admin-Key': adminKey }
+  })
+    .then(r => r.json())
+    .then(data => {
+      agentsData = data;
+      renderAgentsList();
+      if (selectedAgent && agentsData[selectedAgent]) {
+        renderDetail(agentsData[selectedAgent], false);
+      }
+    })
+    .catch(() => {}); // Server not reachable, ignore
+}
+
+// ── SSE ────────────────────────────────────────────────────────────────────
+function connectSSE() {
+  if (evtSource) evtSource.close();
+  evtSource = new EventSource(`${API_BASE}/admin/stream?key=${adminKey}`);
+  evtSource.onmessage = function(e) {
+    try {
+      const msg = JSON.parse(e.data);
+      handleAdminEvent(msg);
+    } catch(err) {}
+  };
+  evtSource.onerror = function() {
+    // SSE error: polling fallback already active
+    evtSource.close();
+    evtSource = null;
+  };
+}
+
+function handleAdminEvent(msg) {
+  const type = msg.type;
+  if (type === 'agent_online') {
+    if (!agentsData[msg.agent_name]) {
+      agentsData[msg.agent_name] = {
+        agent_name: msg.agent_name,
+        role: msg.role,
+        stats: {total:0, clean:0, warning:0, critical:0},
+        violations: [],
+        connected_at: msg.connected_at,
+        last_active: msg.connected_at,
+        status: 'online',
+      };
+    } else {
+      agentsData[msg.agent_name].status = 'online';
+      agentsData[msg.agent_name].connected_at = msg.connected_at;
+    }
+    renderAgentsList();
+    if (selectedAgent === msg.agent_name) renderDetail(agentsData[msg.agent_name], false);
+
+  } else if (type === 'agent_offline') {
+    if (agentsData[msg.agent_name]) {
+      agentsData[msg.agent_name].status = 'offline';
+    }
+    renderAgentsList();
+    if (selectedAgent === msg.agent_name) renderDetail(agentsData[msg.agent_name], false);
+
+  } else if (type === 'violation') {
+    if (agentsData[msg.agent_name]) {
+      agentsData[msg.agent_name].stats = msg.stats;
+      agentsData[msg.agent_name].violations.push(msg.violation);
+      agentsData[msg.agent_name].last_active = msg.violation.timestamp;
+    }
+    renderAgentsList();
+    if (selectedAgent === msg.agent_name) {
+      // live-update scores
+      updateDetailScores(msg.stats);
+      updateDetailLastActive(msg.violation.timestamp);
+      prependViolation(msg.violation, true);
+    }
+  }
+}
+
+// ── Render agents list ─────────────────────────────────────────────────────
+function renderAgentsList() {
+  const scroll = document.getElementById('agents-scroll');
+  const empty = document.getElementById('agents-empty');
+  const names = Object.keys(agentsData);
+
+  if (names.length === 0) {
+    scroll.innerHTML = '<div class="agents-empty" id="agents-empty">Geen agents actief</div>';
+    document.getElementById('online-count').textContent = '0 online';
+    document.getElementById('agents-count').textContent = '0 totaal';
+    return;
+  }
+
+  // Sort: online first, then alphabetical
+  names.sort((a, b) => {
+    const ao = agentsData[a].status === 'online' ? 0 : 1;
+    const bo = agentsData[b].status === 'online' ? 0 : 1;
+    return ao - bo || a.localeCompare(b);
+  });
+
+  const onlineCount = names.filter(n => agentsData[n].status === 'online').length;
+  document.getElementById('online-count').textContent = `${onlineCount} online`;
+  document.getElementById('agents-count').textContent = `${names.length} totaal`;
+
+  scroll.innerHTML = '';
+  names.forEach(name => {
+    const a = agentsData[name];
+    const card = document.createElement('div');
+    card.className = 'agent-card' + (a.status === 'offline' ? ' offline' : '') + (selectedAgent === name ? ' selected' : '');
+    card.innerHTML = `
+      <div class="agent-card-top">
+        <div class="agent-card-left">
+          <div class="status-dot ${a.status}"></div>
+          <span class="agent-name">${esc(a.agent_name)}</span>
+        </div>
+        <span class="role-badge ${a.role}">${a.role === 'nvl' ? 'NVL' : 'Voltera'}</span>
+      </div>
+      <div class="agent-counters">
+        <div class="counter warn">
+          <span class="counter-num">${a.stats.warning}</span>
+          <span class="counter-lbl">Warning</span>
+        </div>
+        <div class="counter crit">
+          <span class="counter-num">${a.stats.critical}</span>
+          <span class="counter-lbl">Critical</span>
+        </div>
+      </div>
+      <div class="agent-meta">Laatste activiteit: ${a.last_active || '—'}</div>`;
+    card.addEventListener('click', () => selectAgent(name));
+    scroll.appendChild(card);
+  });
+}
+
+// ── Select agent + render detail ───────────────────────────────────────────
+function selectAgent(name) {
+  selectedAgent = name;
+  renderAgentsList(); // re-render to update selected highlight
+  renderDetail(agentsData[name], true);
+}
+
+function renderDetail(agent, fullRedraw) {
+  document.getElementById('detail-empty').style.display = 'none';
+  const content = document.getElementById('detail-content');
+  content.style.display = 'flex';
+
+  document.getElementById('d-name').textContent = agent.agent_name +
+    ' — ' + (agent.role === 'nvl' ? 'NVL Planner' : 'Voltera Closer');
+  const dot = document.getElementById('d-dot');
+  dot.className = 'status-dot ' + agent.status;
+  document.getElementById('d-status-text').textContent =
+    agent.status === 'online' ? 'Online' : 'Offline';
+  document.getElementById('d-connected').textContent =
+    'Online sinds: ' + (agent.connected_at || '—');
+  document.getElementById('d-lastactive').textContent =
+    'Laatste activiteit: ' + (agent.last_active || '—');
+
+  updateDetailScores(agent.stats);
+
+  if (fullRedraw) {
+    const vscroll = document.getElementById('d-violations');
+    vscroll.innerHTML = '';
+    if (!agent.violations || agent.violations.length === 0) {
+      vscroll.innerHTML = '<div class="violations-empty">Geen overtredingen deze sessie</div>';
+    } else {
+      // Newest first
+      [...agent.violations].reverse().forEach(v => {
+        vscroll.appendChild(buildViolationEl(v, false));
+      });
+    }
+  }
+}
+
+function updateDetailScores(stats) {
+  document.getElementById('d-total').textContent = stats.total;
+  document.getElementById('d-clean').textContent = stats.clean;
+  document.getElementById('d-warning').textContent = stats.warning;
+  document.getElementById('d-critical').textContent = stats.critical;
+}
+
+function updateDetailLastActive(t) {
+  document.getElementById('d-lastactive').textContent = 'Laatste activiteit: ' + t;
+}
+
+function prependViolation(v, flash) {
+  const vscroll = document.getElementById('d-violations');
+  vscroll.querySelectorAll('.violations-empty').forEach(el => el.remove());
+  const el = buildViolationEl(v, flash);
+  vscroll.insertBefore(el, vscroll.firstChild);
+}
+
+function buildViolationEl(v, flash) {
+  const el = document.createElement('div');
+  el.className = 'v-item ' + v.severity + (flash ? ' flash' : '');
+  el.innerHTML = `
+    <div class="v-item-top">
+      <span class="v-sev">${v.severity === 'critical' ? 'Critical' : 'Warning'}</span>
+      <span class="v-time">${esc(v.timestamp)}</span>
+    </div>
+    <div class="v-rule">${esc(v.rule_violated || '')}</div>
+    ${v.problematic_quote ? `<div class="v-quote">"${esc(v.problematic_quote)}"</div>` : ''}
+    ${v.explanation ? `<div class="v-expl">${esc(v.explanation)}</div>` : ''}`;
+  return el;
+}
+
+// ── Utils ──────────────────────────────────────────────────────────────────
+function esc(str) {
+  return String(str)
+    .replace(/&/g,'&amp;')
+    .replace(/</g,'&lt;')
+    .replace(/>/g,'&gt;')
+    .replace(/"/g,'&quot;');
+}
+</script>
+</body>
+</html>
