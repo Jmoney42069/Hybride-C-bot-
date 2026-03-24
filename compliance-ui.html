@@ -313,6 +313,18 @@ function startSession() {
         resetConversation(data.trigger);
       } catch(err) {}
     });
+    evtSource.addEventListener('call_start', function(e) {
+      try {
+        const data = JSON.parse(e.data);
+        handleCallStart(data.trigger);
+      } catch(err) {}
+    });
+    evtSource.addEventListener('post_call', function(e) {
+      try {
+        const data = JSON.parse(e.data);
+        handlePostCall(data);
+      } catch(err) {}
+    });
   }).catch(() => { btn.disabled = false; });
 }
 function logout() {
@@ -374,27 +386,77 @@ function addLog(type, text, rule) {
     ${rule?`<div class="log-item-rule">${rule}</div>`:''}`;
   scroll.insertBefore(item, scroll.firstChild);
 }
-function resetConversation(trigger) {
+function handleCallStart(trigger) {
+  // Nieuw gesprek gedetecteerd via begroeting
   stats = {total:0, clean:0, warning:0, critical:0};
   updateStats();
   document.getElementById('log-scroll').innerHTML = '<div class="log-empty">Geen overtredingen gedetecteerd</div>';
   document.getElementById('bd-scroll').innerHTML = '<div class="bd-empty" id="bd-empty">Nog geen overtredingen</div>';
   document.getElementById('mic-ring').className = 'mic-ring active';
-  const lh = document.getElementById('last-heard');
-  lh.textContent = 'Nog niks herkend — begin met praten';
-  lh.classList.remove('has-text');
   const card = document.getElementById('result-card');
   card.className = 'result-card clean show';
-  document.getElementById('result-icon').textContent = '✓';
-  document.getElementById('result-title').textContent = 'Gesprek afgesloten';
-  document.getElementById('result-rule').textContent = 'Klaar voor volgend gesprek';
-  document.getElementById('result-expl').textContent = trigger ? '"' + trigger + '"' : '';
+  document.getElementById('result-icon').textContent = '📞';
+  document.getElementById('result-title').textContent = 'Gesprek gestart';
+  document.getElementById('result-rule').textContent = trigger ? '"' + trigger + '"' : '';
+  document.getElementById('result-expl').textContent = '';
   document.getElementById('result-conf').textContent = '';
-  document.getElementById('status-lbl').textContent = 'Klaar voor volgend gesprek';
+  document.getElementById('status-lbl').textContent = 'Gesprek actief — luistert mee...';
+  setTimeout(() => { card.className = 'result-card'; }, 3000);
+}
+function handlePostCall(data) {
+  // Post-call analyse resultaten ontvangen
+  const violations = data.violations || [];
+  const total = data.total_sentences || 0;
+  const card = document.getElementById('result-card');
+  if (violations.length === 0) {
+    card.className = 'result-card clean show';
+    document.getElementById('result-icon').textContent = '✓';
+    document.getElementById('result-title').textContent = 'Analyse compleet — geen overtredingen';
+    document.getElementById('result-rule').textContent = total + ' zinnen geanalyseerd';
+    document.getElementById('result-expl').textContent = '';
+    document.getElementById('result-conf').textContent = '';
+    document.getElementById('status-lbl').textContent = 'Wacht op nieuw gesprek...';
+  } else {
+    const crits = violations.filter(v => v.severity === 'critical').length;
+    const warns = violations.filter(v => v.severity === 'warning').length;
+    const worst = crits > 0 ? 'critical' : 'warning';
+    card.className = 'result-card ' + worst + ' show';
+    document.getElementById('result-icon').textContent = crits > 0 ? '✕' : '⚠';
+    document.getElementById('result-title').textContent = 'Analyse: ' + violations.length + ' overtreding(en)';
+    document.getElementById('result-rule').textContent = (crits ? crits + ' critical ' : '') + (warns ? warns + ' warning' : '');
+    document.getElementById('result-expl').textContent = total + ' zinnen geanalyseerd';
+    document.getElementById('result-conf').textContent = '';
+    document.getElementById('status-lbl').textContent = 'Overtredingen gevonden';
+    // Voeg elke violation toe aan breakdown + log
+    violations.forEach(v => {
+      const sev = v.severity || 'warning';
+      if (sev === 'critical') stats.critical++;
+      else stats.warning++;
+      stats.total++;
+      addBreakdown(sev, v, v.problematic_quote || '');
+      addLog(sev, v.problematic_quote || '', v.rule_violated || '');
+    });
+    updateStats();
+  }
   setTimeout(() => {
     card.className = 'result-card';
-    document.getElementById('status-lbl').textContent = 'Luistert mee...';
-  }, 3000);
+    document.getElementById('status-lbl').textContent = 'Wacht op nieuw gesprek...';
+  }, 8000);
+}
+function resetConversation(trigger) {
+  // Afsluiting gedetecteerd — wacht op post-call analyse
+  document.getElementById('mic-ring').className = 'mic-ring active';
+  const lh = document.getElementById('last-heard');
+  lh.textContent = trigger ? '"' + trigger + '"' : '';
+  lh.classList.add('has-text');
+  const card = document.getElementById('result-card');
+  card.className = 'result-card clean show';
+  document.getElementById('result-icon').textContent = '⏳';
+  document.getElementById('result-title').textContent = 'Gesprek afgesloten — analyseren...';
+  document.getElementById('result-rule').textContent = 'Post-call analyse wordt uitgevoerd';
+  document.getElementById('result-expl').textContent = '';
+  document.getElementById('result-conf').textContent = '';
+  document.getElementById('status-lbl').textContent = 'Analyseren...';
 }
 function handleResult(spokenText, result) {
   const lh = document.getElementById('last-heard');

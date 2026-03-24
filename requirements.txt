@@ -1,7 +1,9 @@
 groq
+cerebras-cloud-sdk
 python-dotenv
 sounddevice
 numpy
 flask
 flask-cors
 soundfile
+requests

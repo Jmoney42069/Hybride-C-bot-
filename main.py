@@ -12,31 +12,64 @@ import sounddevice as sd
 import soundfile as sf
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
+import requests as http_requests
 from flask import Flask, Response, request, jsonify, send_from_directory
-from flask_cors import CORS
 from groq import Groq
+from cerebras.cloud.sdk import Cerebras
 from dotenv import load_dotenv
 
 load_dotenv()
 
-client = Groq(api_key=os.getenv("GROQ_API_KEY"))
-print("🎙️ Groq Whisper API klaar — klaar om te luisteren")
+groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
+cerebras_client = Cerebras(api_key=os.getenv("CEREBRAS_API_KEY"))
+print("🎙️ Groq Whisper + Cerebras LLM klaar — klaar om te luisteren")
+
+CENTRAL_SERVER = os.getenv("CENTRAL_SERVER", "http://localhost:8000")
+AGENT_KEY = os.getenv("AGENT_KEY", "NVL2026")
 
 app = Flask(__name__)
-CORS(app, resources={r"/admin/*": {"origins": "*"}})
 
 result_queue: queue.Queue = queue.Queue()
-admin_queue: queue.Queue = queue.Queue()
 listen_active = threading.Event()
 _listen_thread: threading.Thread | None = None
 session_info: dict = {}
 
-active_agents: dict = {}
-agents_lock = threading.Lock()
 
-ADMIN_KEY = "Voltera"
+def report_to_server(endpoint: str, data: dict) -> None:
+    """Stuurt data naar de centrale server. Bij fout: alleen waarschuwing, geen crash."""
+    try:
+        http_requests.post(
+            f"{CENTRAL_SERVER}{endpoint}",
+            json=data,
+            headers={"X-Agent-Key": AGENT_KEY},
+            timeout=3,
+        )
+    except Exception as e:
+        print(f"[!] Centrale server niet bereikbaar ({endpoint}): {e}")
 
-recent_sentences: deque[str] = deque(maxlen=3)
+
+def _heartbeat_loop() -> None:
+    """Stuurt elke 30 seconden een heartbeat naar de centrale server."""
+    import time
+    while True:
+        time.sleep(30)
+        if listen_active.is_set() and session_info.get('agent_name'):
+            report_to_server('/api/agent/heartbeat', {
+                'agent_name': session_info['agent_name'],
+                'role': session_info.get('role', ''),
+            })
+
+recent_sentences: deque[str] = deque(maxlen=2)
+_call_transcript: list[str] = []  # verzamelt alle zinnen van het huidige gesprek
+_call_active: bool = False  # wordt True bij begroeting, False na afsluiting
+
+GREETING_PHRASES = [
+    "hallo", "goeiedag", "goedendag", "goedemiddag", "goedemorgen",
+    "goedeavond", "goeiemorgen", "goeiemiddag", "goeieavond",
+    "hey ", "hoi ", "welkom", "goed dat u belt",
+    "waarmee kan ik u helpen", "waar kan ik u mee helpen",
+    "fijn dat u belt", "u spreekt met",
+]
 
 CLOSING_PHRASES = [
     "doei", "tot ziens", "fijne dag", "goedendag",
@@ -45,134 +78,33 @@ CLOSING_PHRASES = [
     "fijn weekend", "goed weekend", "bye",
 ]
 
-SYSTEM_PROMPT = """
-Je bent een professionele compliance checker voor telefoongesprekken 
-van het Nationaal Verduurzaming Loket (NVL) en Voltera.
+# Whisper hallucinaties — spooktekst die het model genereert bij stilte/ruis
+WHISPER_GHOSTS = [
+    "ondertitels", "ondertiteling", "bedankt voor het kijken",
+    "thanks for watching", "subscribe", "like and subscribe",
+    "music", "muziek", "applaus", "gelach",
+]
 
-CONTEXT:
-Het NVL is een informatief loket dat woningeigenaren een gratis 
-bespaarplan aanbiedt en doorverwijst naar Voltera.
-Voltera is een installatiebedrijf, geen overheidsinstantie.
-NVL en Voltera werken NIET samen met de overheid en zijn geen overheidsinstantie.
-Wel is het toegestaan en waarheidsgetrouw om te zeggen dat de overheid
-budget heeft vrijgesteld voor energiebesparende maatregelen (zoals via het ISDE,
-Saldering of andere subsidies). Dit mag benoemd worden als feitelijke informatie,
-zolang de agent zich NIET voordoet als overheidsinstantie of impliceert
-dat NVL of Voltera namens de overheid opereert.
-Het Warmtefonds is een onafhankelijke financieringsinstelling.
-Agents mogen alleen informeren en aanraden, nooit verplichten.
-Voltera heeft geen AFM of Wft vergunning.
-
-Er zijn twee soorten agents:
-- NVL agents (planners): informeren en plannen afspraak in
-- Voltera agents (closers): bespreken offerte en installatie
-
-VERBODEN HANDELINGEN (altijd Critical):
-
-Aanvraagproces:
-- Inloggen namens de klant
-- Gegevens invullen voor de klant
-- Documenten uploaden voor de klant
-- Aanvraag samen doorlopen of meekijken op scherm
-
-Financieel:
-- Financieel advies geven over leningen of krediet
-- Bemiddelen in financiering
-
-Identiteit:
-- Zich voordoen als overheidsinstantie
-- Beweren samen te werken met de overheid of namens de overheid te bellen
-- Impliceren dat NVL of Voltera een overheidsorganisatie is
-- Zeggen dat iets wettelijk verplicht is voor de klant
-- Agent vraagt DigiD gegevens op via de telefoon
-
-UIT TE LEGGEN ALS TOEGESTAAN (geen overtreding):
-- Noemen dat de overheid budget heeft vrijgesteld voor energiebesparende maatregelen
-- Uitleggen dat er subsidies of regelingen bestaan (ISDE, saldering, etc.)
-- Zeggen dat klanten gebruik kunnen maken van overheidsstimulering
-  zolang NVL/Voltera zichzelf niet als overheidspartij neerzet
-
-Dwang:
-- Klant onder druk zetten
-- Zeggen dat klant iets moet of verplicht is
-- Urgentie creëren om klant te forceren
-
-Ongepast gedrag:
-- Schelden of ongepast taalgebruik
-
-VERBODEN UITSPRAKEN (Critical):
-- "Dit is de beste optie voor u"
-- "Ik raad dit aan"
-- "Dit past goed bij uw situatie"
-- "Als u dit zo invult wordt het goedgekeurd"
-- "U moet vandaag beslissen"
-- "U bent verplicht"
-- "Wij werken samen met de overheid"
-- "Wij bellen namens de overheid"
-- "Wij zijn een overheidsinstantie"
-- "Dit is een overheidsprogramma"
-- "Dit is verplicht vanuit de overheid"
-- "Ik help u met invullen"
-- "Zal ik met u meekijken"
-
-VERBODEN UITSPRAKEN (Warning):
-- "De meeste klanten kiezen"
-- "Dit is slim om te doen"
-- "Het is maar €X per maand"
-- "Iedereen doet dit"
-- "U komt hier wel voor in aanmerking"
-- "Geen zorgen, dat lukt wel"
-- "Dat wordt goedgekeurd"
-- "U komt in aanmerking"
-- "We komen sowieso installeren"
-- "Dit staat vast"
-- "Maandbedragen of besparingen zonder voorbehoud noemen"
-- "Subsidie is bijna op" / "nog maar weinig plekken"
-- "Wij regelen dat met het Warmtefonds"
-
-TWIJFELREGEL:
-Als een agent een mening geeft of richting stuurt gaat hij te ver.
-De agent moet altijd neutraal blijven of doorverwijzen.
-Zodra een agent een subjectief bijvoeglijk naamwoord gebruikt
-zoals "goed", "slim", "perfect", "ideaal" in relatie tot 
-een keuze van de klant is dit een Warning.
-Normale salespraat en enthousiasme over het product is GEEN overtreding.
-Alleen duidelijke en concrete overtredingen melden.
-Het systeem mag niet te streng zijn — bij twijfel geen overtreding.
-
-LOGISCH MEEDENKEN:
-Beoordeel niet alleen letterlijke zinnen maar ook de intentie.
-Een agent die zegt "maar dit is wel de meest gekozen optie hoor"
-is ook een overtreding ook al staat de exacte zin er niet bij.
-Een agent die technisch uitlegt hoe een formulier werkt 
-zonder te dicteren wat de klant invult is GEEN overtreding.
-Een agent die een regel uitlegt aan de klant is GEEN overtreding.
-Twijfel altijd in het voordeel van de agent.
-
-ANTWOORD ALTIJD ALS JSON:
-{
-  "violation": true of false,
-  "severity": "critical" of "warning" of null,
-  "agent_type": "nvl" of "voltera" of "onbekend",
-  "rule_violated": "naam van de regel of null",
-  "problematic_quote": "exacte zin van de agent of null",
-  "explanation": "korte Nederlandse uitleg of null",
-  "confidence": 0.0 tot 1.0
-}
-
-Confidence onder 0.80 = violation op false zetten
-Critical = directe e-mail naar backoffice
-Warning = alleen printen in terminal, geen e-mail
-Geen overtreding = alles verwijderen
-"""
+# Extreme keywords — alleen deze triggeren een INSTANT alert (geen LLM nodig)
+INSTANT_CRITICAL_KEYWORDS = [
+    # scheldwoorden
+    "lul", "klootzak", "idioot", "achterlijk",
+    "kut", "godver", "kanker", "hoer", "debiel",
+    # DigiD fraude
+    "digid", "ik log even in", "ik log in",
+    # Direct invullen voor klant
+    "ik vul het voor u in", "ik vul het in", "zal ik invullen",
+    "ik upload dat", "ik kijk even mee",
+]
 
 SAMPLE_RATE = 16000
 CHANNELS = 1
-BLOCK_SECONDS = 8        # opnameblok duur in seconden
+BLOCK_SECONDS = 4        # opnameblok duur in seconden
 OVERLAP_SECONDS = 1      # overlap met vorig blok
 ENERGY_THRESHOLD = 0.01  # RMS drempel; lager = stiller blok overgeslagen
 
 _overlap_buffer: np.ndarray = np.array([], dtype=np.float32)
+_audio_queue: queue.Queue = queue.Queue(maxsize=4)
 
 
 def record_block() -> np.ndarray:
@@ -184,35 +116,35 @@ def record_block() -> np.ndarray:
     return audio.flatten()
 
 
-def speech_to_text() -> str | None:
-    """Neemt een 8s blok op, controleert energie en transcribeert via Groq Whisper API."""
+def _recorder_loop() -> None:
+    """Recorder thread: neemt continu blokken op en plaatst ze in de audio queue."""
     global _overlap_buffer
-
-    new_block = record_block()
-
-    # Energie check: sla stille blokken over
-    rms = float(np.sqrt(np.mean(new_block ** 2)))
-    if rms < ENERGY_THRESHOLD:
+    while listen_active.is_set():
+        new_block = record_block()
+        rms = float(np.sqrt(np.mean(new_block ** 2)))
+        if rms < ENERGY_THRESHOLD:
+            _overlap_buffer = new_block[-int(SAMPLE_RATE * OVERLAP_SECONDS):]
+            continue
+        if _overlap_buffer.size > 0:
+            audio_block = np.concatenate([_overlap_buffer, new_block])
+        else:
+            audio_block = new_block
         _overlap_buffer = new_block[-int(SAMPLE_RATE * OVERLAP_SECONDS):]
-        return None
+        try:
+            _audio_queue.put_nowait(audio_block)
+        except queue.Full:
+            pass  # verwerker loopt achter, drop blok
 
-    # Voeg overlap van vorig blok toe voor naadloze zinnen
-    if _overlap_buffer.size > 0:
-        audio_block = np.concatenate([_overlap_buffer, new_block])
-    else:
-        audio_block = new_block
 
-    # Sla overlap op voor volgend blok
-    _overlap_buffer = new_block[-int(SAMPLE_RATE * OVERLAP_SECONDS):]
-
-    # Schrijf audio naar tijdelijk WAV-bestand voor Groq API
+def transcribe_block(audio_block: np.ndarray) -> str | None:
+    """Transcribeert één audio blok via Groq Whisper."""
     tmp_path = None
     try:
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
             tmp_path = f.name
         sf.write(tmp_path, audio_block, SAMPLE_RATE)
         with open(tmp_path, "rb") as audio_file:
-            response = client.audio.transcriptions.create(
+            response = groq_client.audio.transcriptions.create(
                 file=("audio.wav", audio_file, "audio/wav"),
                 model="whisper-large-v3-turbo",
                 language="nl",
@@ -238,35 +170,103 @@ def time_now() -> str:
     return datetime.now().strftime("%H:%M:%S")
 
 
-def check_compliance(text: str) -> dict:
-    """Stuurt tekst naar Groq met context van vorige zinnen."""
-    if recent_sentences:
-        context_lines = "\n".join(
-            f"{i + 1}. {s}" for i, s in enumerate(recent_sentences)
+POST_CALL_PROMPT = """Je bent een compliance checker voor NVL/Voltera salesgesprekken.
+Je krijgt het VOLLEDIGE transcript van één telefoongesprek.
+Analyseer uitsluitend wat de AGENT zegt. Beoordeel intentie en context.
+
+Doceren (uitleggen, informeren) = toegestaan
+Sturen/Handelen (adviseren, garanderen, invullen, druk) = overtreding
+
+CRITICAL: aanvraag overnemen, financieel advies/sturing, garanties over goedkeuring, druk uitoefenen, overheid/partnerschap claimen, ongepast taalgebruik, klant verplichten.
+WARNING: kosten bagatelliseren zonder voorbehoud, groepsdruk, valse urgentie, spreken namens Warmtefonds.
+
+TOEGESTAAN: uitleggen hoe formulier werkt, subsidies feitelijk noemen, voorrekenen met voorbehoud, AFM disclaimer, stappen Warmtefonds uitleggen, eindcontrole vraag.
+
+Belangrijk: "het is €X per maand mits goedgekeurd" is GEEN overtreding (voorbehoud aanwezig).
+
+Antwoord als JSON array van overtredingen. Lege array als geen overtredingen:
+[{"severity":"critical"|"warning","rule_violated":"str","problematic_quote":"exacte zin","explanation":"korte NL uitleg","confidence":float}]
+
+Confidence <0.80 = niet opnemen. Twijfel = in voordeel van de agent."""
+
+
+def analyse_full_transcript(transcript: list[str]) -> list[dict]:
+    """Post-call analyse: stuurt het hele transcript naar qwen-235B."""
+    if not transcript:
+        return []
+
+    numbered = "\n".join(f"{i+1}. {s}" for i, s in enumerate(transcript))
+
+    try:
+        response = cerebras_client.chat.completions.create(
+            model="qwen-3-235b-a22b-instruct-2507",
+            messages=[
+                {"role": "system", "content": POST_CALL_PROMPT},
+                {"role": "user", "content": numbered},
+            ],
+            response_format={"type": "json_object"},
         )
-        user_content = (
-            f"Vorige zinnen ter context:\n{context_lines}\n\n"
-            f"Huidige zin om te checken:\n{text}"
-        )
-    else:
-        user_content = text
+        raw = response.choices[0].message.content.strip()
+        if raw.startswith("```"):
+            lines = raw.splitlines()
+            raw = "\n".join(lines[1:-1])
+        parsed = json.loads(raw)
+        # Kan een dict zijn met key 'violations' of direct een list
+        if isinstance(parsed, dict):
+            parsed = parsed.get("violations", parsed.get("results", []))
+        if not isinstance(parsed, list):
+            parsed = [parsed] if parsed else []
+        return [v for v in parsed if v.get("confidence", 0) >= 0.80]
+    except Exception as e:
+        print(f"{ts()} ❌ Post-call analyse fout: {e}")
+        return []
 
-    response = client.chat.completions.create(
-        model="llama-3.3-70b-versatile",
-        messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": user_content},
-        ],
-        response_format={"type": "json_object"},
-    )
-    raw = response.choices[0].message.content.strip()
 
-    # Verwijder eventuele markdown code fences
-    if raw.startswith("```"):
-        lines = raw.splitlines()
-        raw = "\n".join(lines[1:-1] if lines[-1].strip() == "```" else lines[1:])
+def _process_post_call(transcript: list[str]) -> None:
+    """Draait post-call analyse in een aparte thread zodat de main loop niet blokkeert."""
+    print(f"\n{ts()} 📊 Post-call analyse gestart ({len(transcript)} zinnen)...")
+    violations = analyse_full_transcript(transcript)
 
-    return json.loads(raw)
+    if not violations:
+        print(f"{ts()} ✅ Geen overtredingen in dit gesprek")
+        # Rapporteer schone zinnen naar server voor total_clean counter
+        report_to_server('/api/violation', {
+            'agent_name': session_info.get('agent_name', ''),
+            'role': session_info.get('role', ''),
+            'severity': 'clean',
+            'rule_violated': '',
+            'problematic_quote': '',
+            'explanation': f'{len(transcript)} zinnen geanalyseerd — geen overtredingen',
+            'timestamp': time_now(),
+        })
+        result_queue.put({"type": "post_call", "violations": [], "total_sentences": len(transcript)})
+        return
+
+    print(f"{ts()} 🚨 {len(violations)} overtreding(en) gevonden:")
+    for v in violations:
+        sev = v.get("severity", "?")
+        icon = "🚨" if sev == "critical" else "⚠️"
+        print(f"   {icon} [{sev.upper()}] {v.get('rule_violated', '?')}")
+        print(f"      Quote: {v.get('problematic_quote', '')}")
+        print(f"      Uitleg: {v.get('explanation', '')}")
+
+        # Rapporteer elke overtreding naar de server
+        report_to_server('/api/violation', {
+            'agent_name': session_info.get('agent_name', ''),
+            'role': session_info.get('role', ''),
+            'severity': sev,
+            'rule_violated': v.get('rule_violated', ''),
+            'problematic_quote': v.get('problematic_quote', ''),
+            'explanation': v.get('explanation', ''),
+            'timestamp': time_now(),
+        })
+
+        # Critical → backoffice email
+        if sev == "critical":
+            send_backoffice_alert(v, ts())
+
+    result_queue.put({"type": "post_call", "violations": violations, "total_sentences": len(transcript)})
+    print(f"{ts()} ✅ Post-call analyse compleet")
 
 
 def _smtp_send(gmail_address: str, gmail_password: str, to: str, subject: str, body: str) -> None:
@@ -294,7 +294,7 @@ def send_backoffice_alert(result: dict, timestamp: str) -> None:
     body = (
         f"Tijdstip: {timestamp}\n"
         "Overtreding gedetecteerd in salesgesprek\n\n"
-        f"Agent type: {result.get('agent_type')}\n"
+        f"Agent type: {session_info.get('role', '?')}\n"
         f"Regel:      {result.get('rule_violated')}\n"
         f"Ernst:      {result.get('severity')}\n"
         f"Quote:      {result.get('problematic_quote')}\n"
@@ -310,94 +310,136 @@ def send_backoffice_alert(result: dict, timestamp: str) -> None:
         print(f"{ts()} ❌ E-mail naar backoffice mislukt: {e}")
 
 
-def print_result(result: dict, text: str) -> None:
-    now = ts()
-    confidence = result.get("confidence", 0.0)
-    violation = result.get("violation", False)
-    severity = result.get("severity")
-
-    print(f"\n{now} 🎤 Herkende tekst: {text}")
-
-    if violation and confidence >= 0.80:
-        if severity == "critical":
-            print(f"{now} 🚨 CRITICAL (confidence: {confidence:.2f})")
-            print(f"   Agent  : {result.get('agent_type')}")
-            print(f"   Regel  : {result.get('rule_violated')}")
-            print(f"   Quote  : {result.get('problematic_quote')}")
-            print(f"   Uitleg : {result.get('explanation')}")
-            send_backoffice_alert(result, now)
-        elif severity == "warning":
-            print(f"{now} ⚠️  WARNING (confidence: {confidence:.2f})")
-            print(f"   Agent  : {result.get('agent_type')}")
-            print(f"   Regel  : {result.get('rule_violated')}")
-            print(f"   Quote  : {result.get('problematic_quote')}")
-            print(f"   Uitleg : {result.get('explanation')}")
-    else:
-        print(f"{now} ✅ Geen overtreding (confidence: {confidence:.2f})")
-
-
 def listen_loop() -> None:
-    print("🎧 Compliance BOT luistert — wacht op sessie start\n")
+    print("🎧 Compliance BOT luistert — hybride modus\n")
+
+    # Leeg de queue van eventuele oude blokken
+    while not _audio_queue.empty():
+        try:
+            _audio_queue.get_nowait()
+        except queue.Empty:
+            break
+
+    # Reset transcript voor nieuw gesprek
+    global _call_active
+    _call_transcript.clear()
+    _call_active = False
+
+    # Start recorder thread — neemt continu op terwijl wij verwerken
+    rec_thread = threading.Thread(target=_recorder_loop, daemon=True)
+    rec_thread.start()
+
+    print(f"{ts()} ⏳ Wacht op begroeting om gesprek te starten...")
 
     while listen_active.is_set():
         try:
-            print(f"{ts()} ⏳ Luisteren...")
-            text = speech_to_text()
+            try:
+                audio_block = _audio_queue.get(timeout=1)
+            except queue.Empty:
+                continue
+
+            text = transcribe_block(audio_block)
 
             if text is None:
                 continue
 
             if len(text.split()) < 3:
-                print(f"{ts()} ⏭️  Te kort, overgeslagen")
                 continue
 
+            # Whisper hallucinatie check
             text_lower = text.lower()
+            if any(ghost in text_lower for ghost in WHISPER_GHOSTS):
+                print(f"{ts()} 👻 Whisper hallucinatie gefilterd")
+                continue
+
+            # ── INSTANT ALERT: altijd actief, ook buiten gesprek ──
+            instant_match = next((kw for kw in INSTANT_CRITICAL_KEYWORDS if kw in text_lower), None)
+            if instant_match:
+                print(f"{ts()} 🚨 INSTANT CRITICAL: '{instant_match}' in: {text}")
+                instant_result = {
+                    "severity": "critical",
+                    "rule_violated": "Instant detectie: " + instant_match,
+                    "problematic_quote": text,
+                    "explanation": f"Directe overtreding gedetecteerd: '{instant_match}'",
+                    "confidence": 0.99,
+                }
+                report_to_server('/api/violation', {
+                    'agent_name': session_info.get('agent_name', ''),
+                    'role': session_info.get('role', ''),
+                    'severity': 'critical',
+                    'rule_violated': instant_result['rule_violated'],
+                    'problematic_quote': text,
+                    'explanation': instant_result['explanation'],
+                    'timestamp': time_now(),
+                })
+                send_backoffice_alert(instant_result, ts())
+                result_queue.put({"spoken": text, "result": {"violation": True, **instant_result}})
+
+            # ── GREETING: activeer gesprek als nog niet actief ──
+            if not _call_active:
+                greeting_match = next((g for g in GREETING_PHRASES if g in text_lower), None)
+                if greeting_match:
+                    _call_active = True
+                    _call_transcript.clear()
+                    _call_transcript.append(text)
+                    print(f"\n{ts()} 📞 Nieuw gesprek gedetecteerd: '{text}'")
+                    result_queue.put({"type": "call_start", "trigger": text})
+                    result_queue.put({"spoken": text, "result": {
+                        "violation": False, "severity": None, "confidence": 1.0,
+                        "rule_violated": None, "problematic_quote": None, "explanation": None,
+                    }})
+                else:
+                    # Geen actief gesprek en geen begroeting → skip
+                    print(f"{ts()} 💤 Buiten gesprek: {text[:50]}...")
+                continue
+
+            # ── ACTIEF GESPREK: verzamel transcript ──
+            _call_transcript.append(text)
+            print(f"{ts()} 🎤 [{len(_call_transcript)}] {text}")
+            result_queue.put({"spoken": text, "result": {
+                "violation": False, "severity": None, "confidence": 1.0,
+                "rule_violated": None, "problematic_quote": None, "explanation": None,
+            }})
+
+            # ── CLOSING PHRASE → trigger post-call analyse ──
             closing_match = next((p for p in CLOSING_PHRASES if p in text_lower), None)
             if closing_match:
                 print(f"{ts()} 👋 Gespreksafsluiting gedetecteerd: '{text}'")
+                print(f"{ts()} 📄 Transcript bevat {len(_call_transcript)} zinnen")
+
+                # Kopieer transcript en start post-call analyse in aparte thread
+                transcript_copy = list(_call_transcript)
+                _call_transcript.clear()
+                _call_active = False
                 recent_sentences.clear()
-                agent_name = session_info.get('agent_name', '')
-                with agents_lock:
-                    if agent_name in active_agents:
-                        active_agents[agent_name]['status'] = 'offline'
+
+                threading.Thread(
+                    target=_process_post_call,
+                    args=(transcript_copy,),
+                    daemon=True
+                ).start()
+
                 result_queue.put({"type": "reset", "trigger": text})
-                admin_queue.put({"type": "agent_offline", "agent_name": agent_name})
-                continue
+                report_to_server('/api/agent/reset', {
+                    'agent_name': session_info.get('agent_name', ''),
+                })
+                print(f"{ts()} ⏳ Wacht op begroeting voor volgend gesprek...")
 
-            result = check_compliance(text)
-            print_result(result, text)
-            recent_sentences.append(text)
-
-            agent_name = session_info.get('agent_name', '')
-            now = time_now()
-            with agents_lock:
-                if agent_name in active_agents:
-                    active_agents[agent_name]['last_active'] = now
-                    active_agents[agent_name]['stats']['total'] += 1
-                    violation = result.get('violation', False)
-                    severity = result.get('severity')
-                    if violation and result.get('confidence', 0) >= 0.80 and severity in ('warning', 'critical'):
-                        active_agents[agent_name]['stats'][severity] += 1
-                        v_entry = {
-                            "severity": severity,
-                            "rule_violated": result.get('rule_violated', ''),
-                            "problematic_quote": result.get('problematic_quote', ''),
-                            "explanation": result.get('explanation', ''),
-                            "timestamp": now,
-                        }
-                        active_agents[agent_name]['violations'].append(v_entry)
-                        admin_queue.put({"type": "violation", "agent_name": agent_name, "violation": v_entry,
-                                         "stats": dict(active_agents[agent_name]['stats'])})
-                    else:
-                        active_agents[agent_name]['stats']['clean'] += 1
-
-            result_queue.put({"spoken": text, "result": result})
-
-        except json.JSONDecodeError as e:
-            print(f"{ts()} ❌ Ongeldige JSON van Groq: {e}")
         except Exception as e:
             if listen_active.is_set():
                 print(f"{ts()} ❌ Onverwachte fout: {e}")
+
+    # Sessie gestopt — als er nog een transcript is, analyseer dat ook
+    if _call_transcript and _call_active:
+        print(f"{ts()} 📄 Sessie gestopt met {len(_call_transcript)} zinnen — analyseer...")
+        transcript_copy = list(_call_transcript)
+        _call_transcript.clear()
+        _call_active = False
+        threading.Thread(
+            target=_process_post_call,
+            args=(transcript_copy,),
+            daemon=True
+        ).start()
 
     print(f"{ts()} 🛑 Luister loop gestopt.")
 
@@ -416,18 +458,6 @@ def start():
     agent_name = data.get('agent_name', '')
     role = data.get('role', '')
     session_info = {'agent_name': agent_name, 'role': role}
-    now = time_now()
-    with agents_lock:
-        active_agents[agent_name] = {
-            'agent_name': agent_name,
-            'role': role,
-            'stats': {'total': 0, 'clean': 0, 'warning': 0, 'critical': 0},
-            'violations': [],
-            'connected_at': now,
-            'last_active': now,
-            'status': 'online',
-        }
-    admin_queue.put({'type': 'agent_online', 'agent_name': agent_name, 'role': role, 'connected_at': now})
     # Stop any running loop first
     listen_active.clear()
     if _listen_thread and _listen_thread.is_alive():
@@ -436,6 +466,7 @@ def start():
     listen_active.set()
     _listen_thread = threading.Thread(target=listen_loop, daemon=True)
     _listen_thread.start()
+    report_to_server('/api/agent/online', {'agent_name': agent_name, 'role': role})
     print(f"{ts()} ▶️  Sessie gestart — {role} · {agent_name}")
     return jsonify({'status': 'started'})
 
@@ -444,10 +475,7 @@ def start():
 def stop():
     listen_active.clear()
     agent_name = session_info.get('agent_name', '')
-    with agents_lock:
-        if agent_name in active_agents:
-            active_agents[agent_name]['status'] = 'offline'
-    admin_queue.put({'type': 'agent_offline', 'agent_name': agent_name})
+    report_to_server('/api/agent/offline', {'agent_name': agent_name})
     print(f"{ts()} ⏹️  Sessie gestopt.")
     return jsonify({'status': 'stopped'})
 
@@ -460,6 +488,10 @@ def events():
                 data = result_queue.get(timeout=25)
                 if data.get('type') == 'reset':
                     yield f"event: reset\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
+                elif data.get('type') == 'post_call':
+                    yield f"event: post_call\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
+                elif data.get('type') == 'call_start':
+                    yield f"event: call_start\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
                 else:
                     yield f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
             except queue.Empty:
@@ -471,81 +503,8 @@ def events():
     )
 
 
-# ── Admin helper ──────────────────────────────────────────────────────────────
-
-def _require_admin_key():
-    """Controleert X-Admin-Key header. Geeft None terug bij succes, Response bij fout."""
-    key = request.headers.get('X-Admin-Key', '')
-    if key != ADMIN_KEY:
-        return jsonify({'error': 'Unauthorized'}), 401
-    return None
-
-
-# ── Admin API endpoints ───────────────────────────────────────────────────────
-
-@app.route('/admin/agents')
-def admin_agents():
-    err = _require_admin_key()
-    if err:
-        return err
-    with agents_lock:
-        data = {name: dict(agent) for name, agent in active_agents.items()}
-    return jsonify(data)
-
-
-@app.route('/admin/agents/<agent_name>')
-def admin_agent_detail(agent_name):
-    err = _require_admin_key()
-    if err:
-        return err
-    with agents_lock:
-        agent = active_agents.get(agent_name)
-        if agent is None:
-            return jsonify({'error': 'Agent niet gevonden'}), 404
-        data = dict(agent)
-    return jsonify(data)
-
-
-@app.route('/admin/stream')
-def admin_stream():
-    key = request.args.get('key', '')
-    if key != ADMIN_KEY:
-        return jsonify({'error': 'Unauthorized'}), 401
-
-    # Geef een per-subscriber queue om fan-out te ondersteunen
-    sub_queue: queue.Queue = queue.Queue()
-
-    def producer():
-        while True:
-            try:
-                item = admin_queue.get(timeout=25)
-                sub_queue.put(item)
-                # Fan-out: zet het item terug zodat andere subscribers het ook zien
-                # (simpele single-subscriber aanpak; voor multi-admin uitbreiden met pub/sub)
-            except queue.Empty:
-                sub_queue.put(None)  # keepalive trigger
-
-    prod_thread = threading.Thread(target=producer, daemon=True)
-    prod_thread.start()
-
-    def stream():
-        while True:
-            try:
-                item = sub_queue.get(timeout=30)
-                if item is None:
-                    yield ": keepalive\n\n"
-                else:
-                    yield f"data: {json.dumps(item, ensure_ascii=False)}\n\n"
-            except queue.Empty:
-                yield ": keepalive\n\n"
-
-    return Response(
-        stream(),
-        mimetype='text/event-stream',
-        headers={'Cache-Control': 'no-cache', 'X-Accel-Buffering': 'no'},
-    )
-
-
 if __name__ == '__main__':
+    hb_thread = threading.Thread(target=_heartbeat_loop, daemon=True)
+    hb_thread.start()
     threading.Timer(1.0, lambda: webbrowser.open('http://localhost:5000')).start()
     app.run(host='127.0.0.1', port=5000, debug=False, threaded=True)

@@ -182,9 +182,12 @@
         <div class="detail-hdr">
           <div class="detail-hdr-top">
             <span class="detail-agent-name" id="d-name"></span>
-            <div class="detail-status" id="d-status">
-              <div class="status-dot offline" id="d-dot"></div>
-              <span id="d-status-text">Offline</span>
+            <div style="display:flex;align-items:center;gap:10px">
+              <div class="detail-status" id="d-status">
+                <div class="status-dot offline" id="d-dot"></div>
+                <span id="d-status-text">Offline</span>
+              </div>
+              <button onclick="deleteAgent()" style="font-family:'IBM Plex Mono',monospace;font-size:11px;letter-spacing:.08em;color:var(--red);background:none;border:1px solid rgba(255,23,68,.3);border-radius:4px;padding:4px 10px;cursor:pointer;transition:all .15s" onmouseover="this.style.background='var(--red-bg)'" onmouseout="this.style.background='none'">Verwijderen</button>
             </div>
           </div>
           <div class="detail-meta">
@@ -211,7 +214,7 @@
 </div>
 
 <script>
-const API_BASE = 'http://localhost:5000';
+const API_BASE = 'http://localhost:8000';
 const ADMIN_KEY = 'Voltera';
 const ADMIN_PASS = 'Voltera';
 
@@ -257,11 +260,15 @@ function initDashboard() {
 
 // ── Fetch all agents ───────────────────────────────────────────────────────
 function fetchAgents() {
-  fetch(`${API_BASE}/admin/agents`, {
+  fetch(`${API_BASE}/api/agents`, {
     headers: { 'X-Admin-Key': adminKey }
   })
     .then(r => r.json())
     .then(data => {
+      // Preserve in-memory violations from SSE
+      Object.keys(data).forEach(name => {
+        data[name].violations = (agentsData[name] && agentsData[name].violations) || [];
+      });
       agentsData = data;
       renderAgentsList();
       if (selectedAgent && agentsData[selectedAgent]) {
@@ -274,7 +281,7 @@ function fetchAgents() {
 // ── SSE ────────────────────────────────────────────────────────────────────
 function connectSSE() {
   if (evtSource) evtSource.close();
-  evtSource = new EventSource(`${API_BASE}/admin/stream?key=${adminKey}`);
+  evtSource = new EventSource(`${API_BASE}/api/stream?key=${adminKey}`);
   evtSource.onmessage = function(e) {
     try {
       const msg = JSON.parse(e.data);
@@ -315,10 +322,27 @@ function handleAdminEvent(msg) {
     renderAgentsList();
     if (selectedAgent === msg.agent_name) renderDetail(agentsData[msg.agent_name], false);
 
+  } else if (type === 'agent_deleted') {
+    delete agentsData[msg.agent_name];
+    if (selectedAgent === msg.agent_name) {
+      selectedAgent = null;
+      document.getElementById('detail-content').style.display = 'none';
+      document.getElementById('detail-empty').style.display = 'flex';
+    }
+    renderAgentsList();
+
+  } else if (type === 'agent_reset') {
+    if (agentsData[msg.agent_name]) {
+      agentsData[msg.agent_name].stats = {total:0, clean:0, warning:0, critical:0};
+    }
+    renderAgentsList();
+    if (selectedAgent === msg.agent_name) updateDetailScores({total:0, clean:0, warning:0, critical:0});
+
   } else if (type === 'violation') {
     if (agentsData[msg.agent_name]) {
       agentsData[msg.agent_name].stats = msg.stats;
-      agentsData[msg.agent_name].violations.push(msg.violation);
+      if (!agentsData[msg.agent_name].violations) agentsData[msg.agent_name].violations = [];
+      agentsData[msg.agent_name].violations.unshift(msg.violation);
       agentsData[msg.agent_name].last_active = msg.violation.timestamp;
     }
     renderAgentsList();
@@ -387,8 +411,15 @@ function renderAgentsList() {
 // ── Select agent + render detail ───────────────────────────────────────────
 function selectAgent(name) {
   selectedAgent = name;
-  renderAgentsList(); // re-render to update selected highlight
+  renderAgentsList();
   renderDetail(agentsData[name], true);
+  // Laad volledige overtredingengeschiedenis van de server
+  fetch(`${API_BASE}/api/agents/${encodeURIComponent(name)}/violations`, {
+    headers: { 'X-Admin-Key': adminKey }
+  }).then(r => r.json()).then(viols => {
+    agentsData[name].violations = viols;
+    if (selectedAgent === name) renderDetail(agentsData[name], true);
+  }).catch(() => {});
 }
 
 function renderDetail(agent, fullRedraw) {
@@ -415,8 +446,8 @@ function renderDetail(agent, fullRedraw) {
     if (!agent.violations || agent.violations.length === 0) {
       vscroll.innerHTML = '<div class="violations-empty">Geen overtredingen deze sessie</div>';
     } else {
-      // Newest first
-      [...agent.violations].reverse().forEach(v => {
+      // Newest first (server + unshift already maintain this order)
+      agent.violations.forEach(v => {
         vscroll.appendChild(buildViolationEl(v, false));
       });
     }
@@ -453,6 +484,21 @@ function buildViolationEl(v, flash) {
     ${v.problematic_quote ? `<div class="v-quote">"${esc(v.problematic_quote)}"</div>` : ''}
     ${v.explanation ? `<div class="v-expl">${esc(v.explanation)}</div>` : ''}`;
   return el;
+}
+
+function deleteAgent() {
+  if (!selectedAgent) return;
+  if (!confirm(`Agent "${selectedAgent}" verwijderen? Dit verwijdert ook alle overtredingen.`)) return;
+  fetch(`${API_BASE}/api/agents/${encodeURIComponent(selectedAgent)}`, {
+    method: 'DELETE',
+    headers: { 'X-Admin-Key': adminKey }
+  }).then(() => {
+    delete agentsData[selectedAgent];
+    selectedAgent = null;
+    document.getElementById('detail-content').style.display = 'none';
+    document.getElementById('detail-empty').style.display = 'flex';
+    renderAgentsList();
+  }).catch(() => {});
 }
 
 // ── Utils ──────────────────────────────────────────────────────────────────
