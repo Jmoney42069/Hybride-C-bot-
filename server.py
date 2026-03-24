@@ -1,10 +1,17 @@
 import os
+import sys
 import json
+import csv
+import io
 import sqlite3
 import queue
 import threading
 import time
-from datetime import datetime, date
+import logging
+import logging.handlers
+from datetime import datetime, date, timedelta
+from collections import defaultdict
+from functools import wraps
 from flask import Flask, Response, request, jsonify, send_from_directory
 from flask_cors import CORS
 from dotenv import load_dotenv
@@ -14,9 +21,89 @@ load_dotenv()
 ADMIN_KEY = "Voltera"
 AGENT_KEY = os.getenv("AGENT_KEY", "NVL2026")
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "compliance.db")
+VERSION = "1.0.0"
+
+# ── Logging setup ─────────────────────────────────────────────────────────────
+_LOG_DIR = os.path.dirname(os.path.abspath(__file__))
+
+_server_handler = logging.handlers.RotatingFileHandler(
+    os.path.join(_LOG_DIR, "server.log"),
+    maxBytes=5 * 1024 * 1024, backupCount=5, encoding="utf-8",
+)
+_server_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+
+_error_handler = logging.handlers.RotatingFileHandler(
+    os.path.join(_LOG_DIR, "errors.log"),
+    maxBytes=2 * 1024 * 1024, backupCount=3, encoding="utf-8",
+)
+_error_handler.setLevel(logging.ERROR)
+_error_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s"))
+
+_console_handler = logging.StreamHandler(sys.stdout)
+_console_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+
+log = logging.getLogger("server")
+log.setLevel(logging.INFO)
+log.addHandler(_server_handler)
+log.addHandler(_error_handler)
+log.addHandler(_console_handler)
+
+log.info("=== NVL Compliance Server start (v%s) ===", VERSION)
 
 app = Flask(__name__)
 CORS(app)
+
+
+# ── Rate limiting (60 req/min/IP) ─────────────────────────────────────────────
+_rate_buckets: dict[str, list] = defaultdict(list)
+_rate_lock = threading.Lock()
+RATE_LIMIT = 60
+RATE_WINDOW = 60  # seconds
+
+
+def _check_rate_limit() -> bool:
+    """Returns True if request is within rate limit, False if exceeded."""
+    ip = request.remote_addr or "unknown"
+    now = time.time()
+    with _rate_lock:
+        bucket = _rate_buckets[ip]
+        # Remove old entries
+        _rate_buckets[ip] = [t for t in bucket if now - t < RATE_WINDOW]
+        if len(_rate_buckets[ip]) >= RATE_LIMIT:
+            return False
+        _rate_buckets[ip].append(now)
+    return True
+
+
+@app.before_request
+def rate_limit_check():
+    if not _check_rate_limit():
+        log.warning("Rate limit overschreden door %s", request.remote_addr)
+        return jsonify({"error": "Te veel verzoeken. Probeer later opnieuw."}), 429
+
+
+# ── Input validation / sanitization ───────────────────────────────────────────
+def sanitize_text(value: str, max_len: int = 500) -> str:
+    """Strip HTML tags and limit length."""
+    if not isinstance(value, str):
+        return ""
+    import re
+    clean = re.sub(r"<[^>]+>", "", value)
+    return clean[:max_len].strip()
+
+
+def validate_agent_name(name: str) -> str | None:
+    """Returns sanitized name or None if invalid."""
+    name = sanitize_text(name, 100)
+    if not name or len(name) < 1:
+        return None
+    return name
+
+
+# ── Admin action logging ──────────────────────────────────────────────────────
+def log_admin_action(action: str, detail: str = "") -> None:
+    ip = request.remote_addr or "unknown"
+    log.info("ADMIN ACTION [%s] %s %s", ip, action, detail)
 
 # ── SSE fan-out ───────────────────────────────────────────────────────────────
 _subscribers: list = []
@@ -36,10 +123,19 @@ def broadcast(data: dict) -> None:
             _subscribers.remove(q)
 
 
+# ── SSE rate limiting (max 50 events/sec to any single subscriber) ────────────
+_sse_event_count = 0
+_sse_event_lock = threading.Lock()
+
+
 # ── Database ──────────────────────────────────────────────────────────────────
+_db_lock = threading.Lock()
+
+
 def get_db() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn = sqlite3.connect(DB_PATH, timeout=10, check_same_thread=False)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
     return conn
 
 
@@ -69,10 +165,21 @@ def init_db() -> None:
                 timestamp        TEXT,
                 session_date     TEXT
             );
+            CREATE TABLE IF NOT EXISTS admin_log (
+                id        INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT,
+                ip        TEXT,
+                action    TEXT,
+                detail    TEXT
+            );
         """)
         # Bij elke serverstart: alle agents op offline zetten zodat de UI leeg begint
         conn.execute("UPDATE agents SET status = 'offline'")
         conn.commit()
+        log.info("Database geinitialiseerd: %s", DB_PATH)
+    except Exception as e:
+        log.error("Database init fout: %s", e)
+        raise
     finally:
         conn.close()
 
@@ -106,8 +213,8 @@ def agent_online():
     if err:
         return err
     data = request.get_json(force=True)
-    agent_name = data.get("agent_name", "").strip()
-    role = data.get("role", "").strip()
+    agent_name = validate_agent_name(data.get("agent_name", ""))
+    role = sanitize_text(data.get("role", ""), 50)
     if not agent_name:
         return jsonify({"error": "agent_name vereist"}), 400
     now = time_now()
@@ -129,11 +236,14 @@ def agent_online():
                 total_critical=0
         """, (agent_name, role, now, now))
         conn.commit()
+    except Exception as e:
+        log.error("DB fout bij agent_online: %s", e)
+        return jsonify({"error": "Database fout"}), 500
     finally:
         conn.close()
     broadcast({"type": "agent_online", "agent_name": agent_name,
                "role": role, "connected_at": now})
-    print(f"{ts()} 🟢 Agent online: {agent_name} ({role})")
+    log.info("Agent online: %s (%s)", agent_name, role)
     return jsonify({"status": "ok"})
 
 
@@ -152,7 +262,7 @@ def agent_offline():
     finally:
         conn.close()
     broadcast({"type": "agent_offline", "agent_name": agent_name})
-    print(f"{ts()} 🔴 Agent offline: {agent_name}")
+    log.info("Agent offline: %s", agent_name)
     return jsonify({"status": "ok"})
 
 
@@ -200,7 +310,7 @@ def agent_reset():
     finally:
         conn.close()
     broadcast({"type": "agent_reset", "agent_name": agent_name})
-    print(f"{ts()} 🔄 Gesprek reset: {agent_name}")
+    log.info("Gesprek reset: %s", agent_name)
     return jsonify({"status": "ok"})
 
 
@@ -210,13 +320,13 @@ def add_violation():
     if err:
         return err
     data = request.get_json(force=True)
-    agent_name = data.get("agent_name", "").strip()
-    role = data.get("role", "").strip()
-    severity = data.get("severity", "").strip()
-    rule_violated = data.get("rule_violated", "")
-    problematic_quote = data.get("problematic_quote", "")
-    explanation = data.get("explanation", "")
-    timestamp = data.get("timestamp", time_now())
+    agent_name = sanitize_text(data.get("agent_name", ""), 100)
+    role = sanitize_text(data.get("role", ""), 50)
+    severity = sanitize_text(data.get("severity", ""), 20)
+    rule_violated = sanitize_text(data.get("rule_violated", ""), 500)
+    problematic_quote = sanitize_text(data.get("problematic_quote", ""), 1000)
+    explanation = sanitize_text(data.get("explanation", ""), 1000)
+    timestamp = sanitize_text(data.get("timestamp", time_now()), 20)
     session_date = date.today().isoformat()
 
     conn = get_db()
@@ -244,7 +354,7 @@ def add_violation():
             } if row else {"total": 0, "clean": 0, "warning": 0, "critical": 0}
             conn.close()
             broadcast({"type": "agent_clean", "agent_name": agent_name, "stats": stats})
-            print(f"{ts()} ✅ Clean check van {agent_name}")
+            log.info("Clean check van %s", agent_name)
             return jsonify({"status": "ok"})
 
         conn.execute("""
@@ -305,8 +415,8 @@ def add_violation():
         "violation": v_entry,
         "stats": stats,
     })
-    icon = "🚨" if severity == "critical" else "⚠️"
-    print(f"{ts()} {icon} Violation van {agent_name}: {rule_violated}")
+    icon = "CRITICAL" if severity == "critical" else "WARNING"
+    log.info("Violation van %s: [%s] %s", agent_name, icon, rule_violated)
     return jsonify({"status": "ok"})
 
 
@@ -323,6 +433,7 @@ def delete_agent(agent_name):
     finally:
         conn.close()
     broadcast({"type": "agent_deleted", "agent_name": agent_name})
+    log_admin_action("DELETE_AGENT", agent_name)
     return jsonify({"status": "deleted"})
 
 
@@ -405,6 +516,150 @@ def admin_stream():
     )
 
 
+# ── History / export / status endpoints ───────────────────────────────────────
+
+@app.route("/api/violations/history")
+def violations_history():
+    """Violations met filters: ?date=YYYY-MM-DD&agent=naam&severity=critical|warning"""
+    err = require_admin_key()
+    if err:
+        return err
+    date_filter = request.args.get("date")
+    agent_filter = request.args.get("agent")
+    severity_filter = request.args.get("severity")
+
+    query = "SELECT * FROM violations WHERE 1=1"
+    params = []
+    if date_filter:
+        query += " AND session_date = ?"
+        params.append(sanitize_text(date_filter, 10))
+    if agent_filter:
+        query += " AND agent_name = ?"
+        params.append(sanitize_text(agent_filter, 100))
+    if severity_filter and severity_filter in ("critical", "warning"):
+        query += " AND severity = ?"
+        params.append(severity_filter)
+    query += " ORDER BY id DESC LIMIT 500"
+
+    conn = get_db()
+    try:
+        rows = conn.execute(query, params).fetchall()
+        violations = [dict(row) for row in rows]
+    except Exception as e:
+        log.error("History query fout: %s", e)
+        return jsonify({"error": "Database fout"}), 500
+    finally:
+        conn.close()
+    log_admin_action("VIEW_HISTORY", f"filters: date={date_filter}, agent={agent_filter}, severity={severity_filter}")
+    return jsonify(violations)
+
+
+@app.route("/api/violations/export")
+def violations_export():
+    """CSV export van violations met dezelfde filters als history."""
+    err = require_admin_key()
+    if err:
+        return err
+    date_filter = request.args.get("date")
+    agent_filter = request.args.get("agent")
+    severity_filter = request.args.get("severity")
+
+    query = "SELECT * FROM violations WHERE 1=1"
+    params = []
+    if date_filter:
+        query += " AND session_date = ?"
+        params.append(sanitize_text(date_filter, 10))
+    if agent_filter:
+        query += " AND agent_name = ?"
+        params.append(sanitize_text(agent_filter, 100))
+    if severity_filter and severity_filter in ("critical", "warning"):
+        query += " AND severity = ?"
+        params.append(severity_filter)
+    query += " ORDER BY id DESC"
+
+    conn = get_db()
+    try:
+        rows = conn.execute(query, params).fetchall()
+    except Exception as e:
+        log.error("Export query fout: %s", e)
+        return jsonify({"error": "Database fout"}), 500
+    finally:
+        conn.close()
+
+    output = io.StringIO()
+    writer = csv.writer(output, delimiter=";")
+    writer.writerow(["id", "agent_name", "role", "severity", "rule_violated",
+                     "problematic_quote", "explanation", "timestamp", "session_date"])
+    for row in rows:
+        r = dict(row)
+        writer.writerow([r.get("id"), r.get("agent_name"), r.get("role"),
+                         r.get("severity"), r.get("rule_violated"),
+                         r.get("problematic_quote"), r.get("explanation"),
+                         r.get("timestamp"), r.get("session_date")])
+
+    log_admin_action("EXPORT_CSV", f"{len(rows)} rijen")
+    return Response(
+        output.getvalue(),
+        mimetype="text/csv",
+        headers={"Content-Disposition": f"attachment; filename=violations_{date.today().isoformat()}.csv"},
+    )
+
+
+@app.route("/api/status")
+def system_status():
+    """Systeem status: agents online/offline, totaal violations, server uptime."""
+    err = require_admin_key()
+    if err:
+        return err
+    conn = get_db()
+    try:
+        agents_online = conn.execute("SELECT COUNT(*) FROM agents WHERE status='online'").fetchone()[0]
+        agents_total = conn.execute("SELECT COUNT(*) FROM agents").fetchone()[0]
+        violations_today = conn.execute(
+            "SELECT COUNT(*) FROM violations WHERE session_date=?",
+            (date.today().isoformat(),)
+        ).fetchone()[0]
+        violations_total = conn.execute("SELECT COUNT(*) FROM violations").fetchone()[0]
+        critical_today = conn.execute(
+            "SELECT COUNT(*) FROM violations WHERE session_date=? AND severity='critical'",
+            (date.today().isoformat(),)
+        ).fetchone()[0]
+    except Exception as e:
+        log.error("Status query fout: %s", e)
+        return jsonify({"error": "Database fout"}), 500
+    finally:
+        conn.close()
+
+    uptime_s = int(time.time() - _server_start_time)
+    return jsonify({
+        "version": VERSION,
+        "uptime_seconds": uptime_s,
+        "agents_online": agents_online,
+        "agents_total": agents_total,
+        "violations_today": violations_today,
+        "violations_total": violations_total,
+        "critical_today": critical_today,
+        "sse_subscribers": len(_subscribers),
+    })
+
+
+@app.route("/api/violations/dates")
+def violation_dates():
+    """Geeft lijst van unieke session_dates terug voor de date picker."""
+    err = require_admin_key()
+    if err:
+        return err
+    conn = get_db()
+    try:
+        rows = conn.execute(
+            "SELECT DISTINCT session_date FROM violations ORDER BY session_date DESC LIMIT 90"
+        ).fetchall()
+        dates = [row["session_date"] for row in rows]
+    finally:
+        conn.close()
+    return jsonify(dates)
+
+
 @app.route("/")
 def serve_admin():
     return send_from_directory(".", "admin.html")
@@ -438,20 +693,46 @@ def _offline_check_loop() -> None:
                             )
                             conn.commit()
                             broadcast({"type": "agent_offline", "agent_name": name})
-                            print(f"{ts()} ⏰ Agent automatisch offline: {name} (geen heartbeat)")
+                            log.info("Agent automatisch offline: %s (geen heartbeat)", name)
                     except (ValueError, TypeError):
                         pass
             finally:
                 conn.close()
         except Exception as e:
-            print(f"{ts()} ❌ Offline check fout: {e}")
+            log.error("Offline check fout: %s", e)
+
+
+def _retention_cleanup() -> None:
+    """Verwijdert violations ouder dan 30 dagen. Draait eens per uur."""
+    while True:
+        time.sleep(3600)
+        try:
+            cutoff = (date.today() - timedelta(days=30)).isoformat()
+            conn = get_db()
+            try:
+                result = conn.execute(
+                    "DELETE FROM violations WHERE session_date < ?", (cutoff,)
+                )
+                deleted = result.rowcount
+                conn.commit()
+                if deleted > 0:
+                    log.info("Retention cleanup: %d oude violations verwijderd (voor %s)", deleted, cutoff)
+            finally:
+                conn.close()
+        except Exception as e:
+            log.error("Retention cleanup fout: %s", e)
+
+
+_server_start_time = time.time()
 
 
 if __name__ == "__main__":
     init_db()
-    print("✅ Centrale compliance server gestart op poort 8000")
-    print(f"📊 Database: {DB_PATH}")
-    print("🔑 Admin toegang via: http://localhost:8000")
+    log.info("Centrale compliance server gestart op poort 8000")
+    log.info("Database: %s", DB_PATH)
+    log.info("Admin toegang via: http://localhost:8000")
     offline_thread = threading.Thread(target=_offline_check_loop, daemon=True)
     offline_thread.start()
+    retention_thread = threading.Thread(target=_retention_cleanup, daemon=True)
+    retention_thread.start()
     app.run(host="0.0.0.0", port=8000, debug=False, threaded=True)

@@ -4,3 +4,7 @@ __pycache__/
 *.pyo
 *.tmp
 compliance.db
+build/
+dist/
+build-log*.txt
+*.log

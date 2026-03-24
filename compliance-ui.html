@@ -61,6 +61,25 @@
   .logout-btn{font-family:'IBM Plex Mono',monospace;font-size:11px;letter-spacing:.08em;color:var(--text-dim);background:none;border:1px solid var(--border);border-radius:4px;padding:5px 10px;cursor:pointer;transition:all .15s}
   .logout-btn:hover{color:var(--text-muted);border-color:#3A3A3A}
 
+  /* ── Connection indicator ── */
+  .conn-indicator{display:flex;align-items:center;gap:6px;font-family:'IBM Plex Mono',monospace;font-size:11px}
+  .conn-dot{width:8px;height:8px;border-radius:50%;transition:background .3s}
+  .conn-dot.green{background:var(--green);box-shadow:0 0 6px var(--green)}
+  .conn-dot.orange{background:#FF9100;box-shadow:0 0 6px #FF9100}
+  .conn-dot.red{background:var(--red);box-shadow:0 0 6px var(--red)}
+  .conn-text{color:var(--text-muted)}
+
+  /* ── Call summary toast ── */
+  .call-summary-toast{position:fixed;top:20px;right:20px;background:var(--surface2);border:1px solid var(--border);border-radius:10px;padding:18px 24px;min-width:320px;max-width:420px;z-index:1000;opacity:0;transform:translateY(-20px);transition:all .3s ease;pointer-events:none}
+  .call-summary-toast.show{opacity:1;transform:translateY(0);pointer-events:auto}
+  .call-summary-toast .toast-title{font-family:'IBM Plex Mono',monospace;font-size:12px;letter-spacing:.1em;text-transform:uppercase;margin-bottom:10px;display:flex;align-items:center;gap:8px}
+  .call-summary-toast.clean .toast-title{color:var(--green)}
+  .call-summary-toast.has-violations .toast-title{color:var(--red)}
+  .call-summary-toast .toast-stats{display:flex;gap:16px;font-family:'IBM Plex Mono',monospace;font-size:13px}
+  .call-summary-toast .toast-stat{display:flex;align-items:baseline;gap:4px}
+  .call-summary-toast .toast-stat-num{font-size:20px;font-weight:500}
+  .call-summary-toast .toast-close{position:absolute;top:10px;right:14px;background:none;border:none;color:var(--text-dim);cursor:pointer;font-size:16px;padding:4px}
+
   .main-content{display:grid;grid-template-columns:260px 1fr 300px;flex:1;min-height:0}
 
   /* LEFT */
@@ -181,9 +200,17 @@
       </div>
     </div>
     <div class="topbar-right">
+      <div class="conn-indicator" id="conn-backend" title="Backend server verbinding">
+        <div class="conn-dot red" id="conn-backend-dot"></div>
+        <span class="conn-text" id="conn-backend-text">Backend</span>
+      </div>
+      <div class="conn-indicator" id="conn-whisper" title="Whisper spraakherkenning">
+        <div class="conn-dot green" id="conn-whisper-dot"></div>
+        <span class="conn-text" id="conn-whisper-text">Whisper</span>
+      </div>
       <div class="status-ind">
-        <div class="status-dot"></div>
-        <span>Luistert mee</span>
+        <div class="status-dot" id="listen-dot"></div>
+        <span id="listen-status">Luistert mee</span>
       </div>
       <button class="logout-btn" onclick="logout()">Uitloggen</button>
     </div>
@@ -259,11 +286,100 @@
   </div>
 </div>
 
+<!-- Call summary toast -->
+<div class="call-summary-toast" id="call-summary-toast">
+  <button class="toast-close" onclick="dismissToast()">&times;</button>
+  <div class="toast-title" id="toast-title">Gesprek afgerond</div>
+  <div class="toast-stats" id="toast-stats"></div>
+</div>
+
 <script>
 let selectedRole = null, agentName = '';
 let stats = {total:0, clean:0, warning:0, critical:0};
 let timerInterval = null;
 let evtSource = null;
+let _healthInterval = null;
+let _whisperOk = true;
+let _backendOk = false;
+let _toastTimer = null;
+
+// ── Connection health check ────────────────────────────────────────────────
+function checkHealth() {
+  fetch('/health').then(r => r.json()).then(data => {
+    _backendOk = data.backend_connected;
+    const dot = document.getElementById('conn-backend-dot');
+    const txt = document.getElementById('conn-backend-text');
+    if (_backendOk) {
+      dot.className = 'conn-dot green';
+      txt.textContent = 'Backend';
+    } else {
+      dot.className = 'conn-dot red';
+      txt.textContent = 'Backend offline';
+    }
+  }).catch(() => {
+    _backendOk = false;
+    const dot = document.getElementById('conn-backend-dot');
+    if (dot) { dot.className = 'conn-dot red'; }
+  });
+}
+
+function setWhisperStatus(ok) {
+  _whisperOk = ok;
+  const dot = document.getElementById('conn-whisper-dot');
+  const txt = document.getElementById('conn-whisper-text');
+  if (!dot) return;
+  if (ok) {
+    dot.className = 'conn-dot green';
+    txt.textContent = 'Whisper';
+  } else {
+    dot.className = 'conn-dot orange';
+    txt.textContent = 'Whisper wacht...';
+  }
+}
+
+// ── Call summary toast ─────────────────────────────────────────────────────
+function showCallSummary(violations, totalSentences) {
+  const toast = document.getElementById('call-summary-toast');
+  const title = document.getElementById('toast-title');
+  const statsDiv = document.getElementById('toast-stats');
+  toast.className = 'call-summary-toast';
+
+  const crits = violations.filter(v => v.severity === 'critical').length;
+  const warns = violations.filter(v => v.severity === 'warning').length;
+
+  if (violations.length === 0) {
+    toast.classList.add('clean');
+    title.innerHTML = '&#10003; Gesprek schoon';
+    statsDiv.innerHTML = `
+      <div class="toast-stat"><span class="toast-stat-num" style="color:var(--green)">${totalSentences}</span> zinnen</div>
+      <div class="toast-stat"><span class="toast-stat-num" style="color:var(--green)">0</span> overtredingen</div>`;
+  } else {
+    toast.classList.add('has-violations');
+    title.innerHTML = '&#9888; ' + violations.length + ' overtreding(en)';
+    statsDiv.innerHTML = `
+      <div class="toast-stat"><span class="toast-stat-num" style="color:var(--text-muted)">${totalSentences}</span> zinnen</div>
+      ${crits ? '<div class="toast-stat"><span class="toast-stat-num" style="color:var(--red)">' + crits + '</span> critical</div>' : ''}
+      ${warns ? '<div class="toast-stat"><span class="toast-stat-num" style="color:var(--yellow)">' + warns + '</span> warning</div>' : ''}`;
+  }
+  toast.classList.add('show');
+  if (_toastTimer) clearTimeout(_toastTimer);
+  _toastTimer = setTimeout(dismissToast, 10000);
+}
+
+function dismissToast() {
+  const toast = document.getElementById('call-summary-toast');
+  toast.classList.remove('show');
+  if (_toastTimer) { clearTimeout(_toastTimer); _toastTimer = null; }
+}
+
+// Auto-login: check of agent al geconfigureerd is via installer
+fetch('/config').then(r => r.json()).then(cfg => {
+  if (cfg.preconfigured) {
+    selectedRole = cfg.role;
+    agentName = cfg.agent_name;
+    startSession();
+  }
+}).catch(() => {});
 
 function selectRole(r) {
   selectedRole = r;
@@ -279,6 +395,45 @@ function checkReady() {
 function startSession() {
   const btn = document.getElementById('start-btn');
   btn.disabled = true;
+  btn.textContent = 'Verbinding controleren...';
+  // Check backend eerst
+  fetch('/health').then(r => r.json()).then(h => {
+    if (!h.backend_connected) {
+      if (!confirm('Backend server (' + (h.central_server || '?') + ') is niet bereikbaar.\\n\\nToch doorgaan? (Overtredingen worden niet centraal opgeslagen)')) {
+        btn.disabled = false;
+        btn.textContent = 'Sessie starten';
+        return;
+      }
+    }
+    btn.textContent = 'Microfoon controleren...';
+    // Check microfoon
+    fetch('/devices').then(r => r.json()).then(d => {
+      if (!d.mic_ok) {
+        alert('MICROFOON PROBLEEM:\\n\\n' + (d.mic_info || 'Geen microfoon gevonden') +
+              '\\n\\nControleer:\\n1. Is er een microfoon aangesloten?\\n2. Heeft de app toestemming?\\n3. Is de microfoon ingesteld als standaard opnameapparaat?\\n\\nLog: ' + (d.log_path || ''));
+        btn.disabled = false;
+        btn.textContent = 'Sessie starten';
+        return;
+      }
+      _doStart();
+    }).catch(() => { _doStart(); });
+  }).catch(() => {
+    // Health check zelf mislukt — probeer toch te starten
+    btn.textContent = 'Microfoon controleren...';
+    fetch('/devices').then(r => r.json()).then(d => {
+      if (!d.mic_ok) {
+        alert('MICROFOON PROBLEEM:\\n\\n' + (d.mic_info || 'Geen microfoon gevonden'));
+        btn.disabled = false;
+        btn.textContent = 'Sessie starten';
+        return;
+      }
+      _doStart();
+    }).catch(() => { _doStart(); });
+  });
+}
+function _doStart() {
+  const btn = document.getElementById('start-btn');
+  btn.textContent = 'Starten...';
   fetch('/start', {
     method: 'POST',
     headers: {'Content-Type': 'application/json'},
@@ -293,6 +448,9 @@ function startSession() {
     document.getElementById('session-name').textContent = agentName;
     document.getElementById('mic-ring').classList.add('active');
     document.getElementById('status-lbl').textContent = 'Luistert mee...';
+    // Start health check
+    checkHealth();
+    _healthInterval = setInterval(checkHealth, 15000);
     const start = Date.now();
     timerInterval = setInterval(() => {
       const e = Math.floor((Date.now()-start)/1000);
@@ -304,6 +462,7 @@ function startSession() {
     evtSource.onmessage = function(e) {
       try {
         const data = JSON.parse(e.data);
+        setWhisperStatus(true);
         window.handleResult(data.spoken, data.result);
       } catch(err) {}
     };
@@ -325,11 +484,21 @@ function startSession() {
         handlePostCall(data);
       } catch(err) {}
     });
-  }).catch(() => { btn.disabled = false; });
+    evtSource.addEventListener('error_msg', function(e) {
+      try {
+        const data = JSON.parse(e.data);
+        document.getElementById('status-lbl').textContent = data.message || 'Fout';
+        document.getElementById('mic-ring').classList.remove('active');
+        setWhisperStatus(false);
+        alert('FOUT: ' + (data.message || 'Onbekende fout'));
+      } catch(err) {}
+    });
+  }).catch(() => { btn.disabled = false; btn.textContent = 'Sessie starten'; });
 }
 function logout() {
   fetch('/stop', {method: 'POST'});
   if (evtSource) { evtSource.close(); evtSource = null; }
+  if (_healthInterval) { clearInterval(_healthInterval); _healthInterval = null; }
   clearInterval(timerInterval);
   selectedRole = null; agentName = '';
   stats = {total:0,clean:0,warning:0,critical:0};
@@ -442,6 +611,8 @@ function handlePostCall(data) {
     card.className = 'result-card';
     document.getElementById('status-lbl').textContent = 'Wacht op nieuw gesprek...';
   }, 8000);
+  // Show call summary toast
+  showCallSummary(violations, total);
 }
 function resetConversation(trigger) {
   // Afsluiting gedetecteerd — wacht op post-call analyse

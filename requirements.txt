@@ -7,3 +7,5 @@ flask
 flask-cors
 soundfile
 requests
+pyinstaller
+pywin32
